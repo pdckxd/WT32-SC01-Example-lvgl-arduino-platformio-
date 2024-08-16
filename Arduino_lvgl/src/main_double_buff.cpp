@@ -1,0 +1,897 @@
+#include <Arduino.h>
+
+#include <Wire.h>
+
+#include "FT62XXTouchScreen.h"
+#include <SPI.h>
+#include <TFT_eSPI.h>
+
+// TFT_eSPI tft = TFT_eSPI();
+FT62XXTouchScreen touchScreen = FT62XXTouchScreen(TFT_HEIGHT, PIN_SDA, PIN_SCL);
+
+#include "demos/lv_demos.h"
+#include "esp_freertos_hooks.h"
+#include "lv_conf_internal.h"
+#include "lvgl.h"
+
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <optional>
+#include <stdio.h>
+#include <string>
+
+#define DRAW_BUF_SIZE (TFT_WIDTH * TFT_HEIGHT / 10 * (LV_COLOR_DEPTH / 8))
+
+uint32_t draw_buf[DRAW_BUF_SIZE / 4];
+
+// If logging is enabled, it will inform the user about what is happening in the
+// library
+static void log_print(lv_log_level_t level, const char *buf) {
+  LV_UNUSED(level);
+  Serial.println(buf);
+  Serial.flush();
+}
+
+uint16_t lastx = 0;
+uint16_t lasty = 0;
+
+void touchscreen_read(lv_indev_t *drv, lv_indev_data_t *data) {
+  // Serial.println("#");
+  TouchPoint touchPos = touchScreen.read();
+  if (touchPos.touched) {
+    // map x,y coordinate to device
+    touchPos.xPos = map(touchPos.xPos, 480, 0, 0, 480);
+    touchPos.yPos = map(touchPos.yPos, 320, 0, 0, 320);
+    // Serial.println(String(touchPos.xPos) + ": " + String(touchPos.yPos));
+    data->state = LV_INDEV_STATE_PR;
+    data->point.x = touchPos.xPos;
+    data->point.y = touchPos.yPos;
+    lastx = touchPos.xPos;
+    lasty = touchPos.yPos;
+  } else {
+    data->state = LV_INDEV_STATE_REL;
+    data->point.x = lastx;
+    data->point.y = lasty;
+  }
+}
+static void lv_tick_task(void) { lv_tick_inc(portTICK_RATE_MS); }
+
+// *=======================
+
+LV_FONT_DECLARE(nerd_sun);
+LV_FONT_DECLARE(ms_yahei);
+
+#define SYMBOL_DRYER "\xF3\xB0\xA4\x97"
+#define SYMBOL_DRYER_ALERT "\xF3\xB1\x86\xBA"
+#define SYMBOL_FAN "\xEE\xBE\xA7"
+
+typedef struct mobile_arc_obj_t {
+  lv_obj_t *arc_obj;
+  lv_obj_t *label_number_obj;
+  lv_obj_t *charging_icon_obj;
+
+  bool is_charging;
+  std::optional<uint8_t> percent;
+
+  void set_is_charging(bool charging) {
+    this->is_charging = charging;
+
+    if (charging == false) {
+      lv_obj_add_flag(this->charging_icon_obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_remove_flag(this->charging_icon_obj, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  bool set_percent(const std::string percent_string) {
+    const char *start = percent_string.c_str();
+    char *endptr;
+    long num = strtol(start, &endptr, 10);
+    if (percent_string.empty() == false && start != endptr) {
+      lv_label_set_text(this->label_number_obj, (percent_string + "%").c_str());
+      lv_obj_set_style_text_color(this->label_number_obj,
+                                  lv_color_make(0, 0, 0), 0);
+      lv_arc_set_value(this->arc_obj, num);
+      this->percent = (uint8_t)num;
+
+      return true;
+    } else {
+      lv_label_set_text(this->label_number_obj, "N/a");
+      lv_obj_set_style_text_color(this->label_number_obj,
+                                  lv_palette_main(LV_PALETTE_GREY), 0);
+      lv_arc_set_value(this->arc_obj, 0);
+      set_is_charging(false);
+      this->percent = std::nullopt;
+    }
+
+    return false;
+  }
+
+  void set_offline() {
+    this->percent = std::nullopt;
+    this->is_charging = false;
+
+    this->set_percent("");
+    this->set_is_charging(false);
+  }
+} mobile_arc_obj_t;
+
+typedef struct home_current_power_obj_t {
+  lv_obj_t *arc_obj;
+  lv_obj_t *label_number_obj;
+  uint16_t max_power;
+
+  std::optional<uint8_t> percent;
+
+  bool set_percent(const std::string percent_string) {
+    const char *start = percent_string.c_str();
+    char *endptr;
+    long num = strtol(start, &endptr, 10);
+    if (percent_string.empty() == false && start != endptr) {
+      lv_label_set_text(this->label_number_obj,
+                        (percent_string + " W").c_str());
+      lv_obj_set_style_text_color(this->label_number_obj,
+                                  lv_color_make(0, 0, 0), 0);
+      lv_arc_set_value(this->arc_obj, num / (this->max_power * 1.0) * 360);
+      this->percent = (uint8_t)num;
+      return true;
+    } else {
+      lv_label_set_text(this->label_number_obj, "N/a");
+      lv_obj_set_style_text_color(this->label_number_obj,
+                                  lv_palette_main(LV_PALETTE_GREY), 0);
+      lv_arc_set_value(this->arc_obj, 0);
+      this->percent = std::nullopt;
+    }
+
+    return false;
+  }
+
+} home_current_power_obj_t;
+
+typedef struct washer_dryer_obj_t {
+  lv_obj_t *arc_obj;
+  lv_obj_t *label_number_obj;
+  lv_obj_t *label_status_txt_obj;
+  lv_obj_t *bell_icon_obj;
+  lv_obj_t *animation_icon_obj;
+
+  // total min (max)
+  uint16_t max_minutes;
+  std::optional<uint16_t> minutes;
+  bool alarming;
+  std::optional<std::string> status;
+
+  bool set_minutes(const std::string minutes_string) {
+    const char *start = minutes_string.c_str();
+    char *endptr;
+    long num = strtol(start, &endptr, 10);
+    if (minutes_string.empty() == false && start != endptr) {
+      if (num > this->max_minutes) {
+        this->max_minutes = num;
+      }
+      lv_label_set_text(this->label_number_obj,
+                        (minutes_string + " min").c_str());
+      lv_obj_set_style_text_color(this->label_number_obj,
+                                  lv_color_make(0, 0, 0), 0);
+      lv_arc_set_value(this->arc_obj, (this->max_minutes - num) * 1.0 /
+                                          this->max_minutes * 100);
+      return true;
+    } else {
+      lv_label_set_text(this->label_number_obj, "N/a");
+      this->max_minutes = 0;
+      lv_obj_set_style_text_color(this->label_number_obj,
+                                  lv_palette_main(LV_PALETTE_GREY), 0);
+      lv_arc_set_value(this->arc_obj, 0);
+      this->minutes = std::nullopt;
+    }
+
+    return false;
+  }
+
+  bool set_status(const std::string status_string) {
+    if (status_string.empty() == false) {
+      lv_label_set_text(this->label_status_txt_obj, status_string.c_str());
+      lv_obj_set_style_text_color(this->label_status_txt_obj,
+                                  lv_color_make(0, 0, 0), 0);
+      return true;
+    } else {
+      lv_label_set_text(this->label_status_txt_obj, "N/a");
+      lv_obj_set_style_text_color(this->label_status_txt_obj,
+                                  lv_palette_main(LV_PALETTE_GREY), 0);
+      this->status = std::nullopt;
+    }
+
+    return false;
+  }
+
+  void set_alarming(bool is_alarm) {
+    if (is_alarm == true) {
+      lv_obj_remove_flag(this->bell_icon_obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(this->bell_icon_obj, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  void set_animate(bool is_animate) {
+    if (is_animate == true) {
+      lv_obj_remove_flag(this->animation_icon_obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(this->animation_icon_obj, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+} washer_dryer_obj_t;
+
+enum class single_power_num_type_e { POWER, ELECTRICITY_CONSUMPTION };
+
+typedef struct event_single_power_num_t {
+  lv_obj_t *label_number_obj;
+  single_power_num_type_e num_type;
+
+  std::optional<float> number;
+
+  void set_number(std::string number_string) {
+    const char *start = number_string.c_str();
+    char *endptr;
+    float num = strtof(start, &endptr);
+    if (number_string.empty() == false && start != endptr) {
+      lv_label_set_text(
+          this->label_number_obj,
+          (number_string +
+           (num_type == single_power_num_type_e::POWER ? " W" : ""))
+              .c_str());
+      lv_obj_set_style_text_color(this->label_number_obj,
+                                  lv_color_make(0, 0, 0), 0);
+      this->number = num;
+    } else {
+      lv_label_set_text(this->label_number_obj, "N/a");
+      lv_color_t number_color;
+      switch (this->num_type) {
+      case single_power_num_type_e::POWER:
+        number_color = lv_palette_main(LV_PALETTE_GREY);
+        break;
+      case single_power_num_type_e::ELECTRICITY_CONSUMPTION:
+        number_color = lv_color_make(255, 255, 255);
+        break;
+      }
+      lv_obj_set_style_text_color(this->label_number_obj, number_color, 0);
+      this->number = std::nullopt;
+    }
+  }
+} event_single_power_num_t;
+
+static lv_obj_t *tv;
+static lv_obj_t *t1;
+static lv_obj_t *t2;
+static lv_obj_t *t3;
+
+static lv_style_t arc_style;
+static lv_style_t label_font18_style;
+static lv_style_t label_ms_yahei_style;
+static lv_style_t label_font32_style;
+static lv_style_t charging_label_style;
+static lv_style_t label_style_nerd_sun;
+static char arc_ids[12][32] = {
+    "iPhone11PM", "iPhone12PM", "iPadPro-S", "iPadPro-A", "iPadMini5", "iPad4",
+    "iPadMini6",  "iPadMini2",  "iPhone6",   "iPhone7P",  "iPhone5",   ""};
+
+// Mobile Tab Controls
+static std::map<std::string, mobile_arc_obj_t> mobile_arc_objs;
+
+// Event Tab washer & dryer controls
+static washer_dryer_obj_t event_washer_obj;
+static washer_dryer_obj_t event_dryer_obj;
+
+// Event Tab current total power control
+static home_current_power_obj_t home_current_power_obj;
+
+// Event Tab power grid table controls
+static event_single_power_num_t event_today_power_num_obj;
+static event_single_power_num_t event_yesterday_power_num_obj;
+static event_single_power_num_t event_fridge_power_num_obj;
+static event_single_power_num_t event_lift_table_power_num_obj;
+static event_single_power_num_t event_pc_table_power_num_obj;
+static event_single_power_num_t event_mac_table_power_num_obj;
+static event_single_power_num_t event_jigui_power_num_obj;
+static event_single_power_num_t event_baobao_power_num_obj;
+
+static void event_handler(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+
+  if (code == LV_EVENT_CLICKED) {
+    LV_LOG_USER("Clicked");
+
+    mobile_arc_obj_t &mobile_arc_obj = mobile_arc_objs["iPhone11PM"];
+    mobile_arc_obj.set_is_charging(true);
+    // mobile_arc_obj.percent = 50;
+    mobile_arc_obj.set_percent("80");
+
+    event_today_power_num_obj.set_number("1.234");
+    event_lift_table_power_num_obj.set_number("345");
+    //
+
+    //
+    home_current_power_obj.set_percent("100");
+
+    //
+    // event_washer_obj.max_minutes = 360;
+    // event_washer_obj.set_minutes("100");
+    // event_washer_obj.set_status("");
+    // event_washer_obj.set_alarming(false);
+    // event_washer_obj.set_animate(false);
+    //
+    event_dryer_obj.max_minutes = 240;
+    event_dryer_obj.set_minutes("60");
+    event_dryer_obj.set_status("冷风2");
+    event_dryer_obj.set_alarming(true);
+    event_dryer_obj.set_animate(true);
+  } else if (code == LV_EVENT_VALUE_CHANGED) {
+    LV_LOG_USER("Toggled");
+  }
+}
+
+static void anim_angle_cb(void *var, int32_t angle) {
+  // printf("angle: %d\n", angle);
+  lv_img_set_angle((lv_obj_t *)var, angle);
+}
+
+static void anim_set_ball_hidden(void *var, int32_t flag) {
+  // lv_obj_add_flag((lv_obj_t *)var, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_text_opa((lv_obj_t *)var, flag, 0);
+}
+
+static void create_single_mobile_arc(int i, int col, int row) {
+  if (std::string(arc_ids[i]).empty()) {
+    return;
+  }
+  lv_obj_t *arc_obj = lv_arc_create(t1);
+  lv_obj_add_style(arc_obj, &arc_style, LV_PART_MAIN);
+  lv_obj_add_style(arc_obj, &arc_style, LV_PART_INDICATOR);
+
+  // if (col % 2 == 0) {
+  //   lv_obj_set_style_arc_color(arc_obj, lv_palette_main(LV_PALETTE_RED),
+  //                              LV_PART_INDICATOR);
+  // }
+  lv_obj_set_size(arc_obj, 100, 100);
+  lv_arc_set_rotation(arc_obj, 180);
+  lv_arc_set_bg_angles(arc_obj, 0, 180);
+  lv_obj_remove_style(arc_obj, NULL,
+                      LV_PART_KNOB); /*Be sure the knob is not displayed*/
+  lv_obj_remove_flag(arc_obj,
+                     LV_OBJ_FLAG_CLICKABLE); /*To not allow adjusting by click*/
+  lv_arc_set_value(arc_obj, 50);
+  lv_obj_center(arc_obj);
+
+  lv_obj_t *number = lv_label_create(arc_obj);
+  lv_obj_add_style(number, &label_font18_style, LV_PART_MAIN);
+  lv_label_set_text(number, "N/a");
+  lv_obj_center(number);
+
+  lv_obj_t *device_name = lv_label_create(arc_obj);
+  /* lv_obj_add_style(device_name, &label_style, LV_PART_MAIN); */
+  lv_label_set_text(device_name, arc_ids[i]);
+  lv_obj_set_style_pad_bottom(device_name, 20, LV_PART_MAIN);
+  lv_obj_align(device_name, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+  lv_obj_t *charging_symbol = lv_label_create(arc_obj);
+  /* lv_obj_add_style(device_name, &label_style, LV_PART_MAIN); */
+  lv_label_set_text(charging_symbol, LV_SYMBOL_CHARGE);
+  lv_obj_add_style(charging_symbol, &charging_label_style,
+                   LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_pad_top(charging_symbol, 24, LV_PART_MAIN);
+  lv_obj_align(charging_symbol, LV_ALIGN_TOP_MID, 0, 0);
+
+  /* lv_obj_set_pos(number, 30, 30); */
+
+  lv_obj_set_grid_cell(arc_obj, LV_GRID_ALIGN_CENTER, col, 1,
+                       LV_GRID_ALIGN_CENTER, row, 1);
+  mobile_arc_obj_t arc_obj_to_add{.arc_obj = arc_obj,
+                                  .label_number_obj = number,
+                                  .charging_icon_obj = charging_symbol,
+                                  .is_charging = false,
+                                  .percent = std::nullopt};
+  arc_obj_to_add.set_offline();
+  mobile_arc_objs.emplace(std::string(arc_ids[i]), arc_obj_to_add);
+}
+static void create_mobile_tab() {
+  lv_obj_set_style_pad_top(t1, 30, LV_PART_MAIN);
+  lv_obj_clear_flag(t1, LV_OBJ_FLAG_SCROLLABLE);
+
+  static int32_t grid_mobile_tab_col_dsc[] = {100, 100, 100, 100,
+                                              LV_GRID_TEMPLATE_LAST};
+  static int32_t grid_mobile_tab_row_dsc[] = {73, 73, 73,
+                                              LV_GRID_TEMPLATE_LAST};
+
+  lv_obj_set_grid_dsc_array(t1, grid_mobile_tab_col_dsc,
+                            grid_mobile_tab_row_dsc);
+
+  for (int i = 0; i < 12; i++) {
+    uint8_t col = i % 4;
+    uint8_t row = i / 4;
+    create_single_mobile_arc(i, col, row);
+    printf("c%d, r%d\n", col, row);
+  }
+
+  // auto tmp = arc_objs.find("iPhone11PM");
+  // printf("tmp=%s\n", tmp->first.c_str());
+}
+
+static home_current_power_obj_t
+create_home_current_power_panel(lv_obj_t *cont) {
+  lv_obj_t *arc_current_home_power = lv_arc_create(cont);
+  lv_obj_set_size(arc_current_home_power, 120, 120);
+  lv_arc_set_rotation(arc_current_home_power, 270);
+  lv_arc_set_bg_angles(arc_current_home_power, 0, 360);
+  lv_obj_remove_style(arc_current_home_power, NULL,
+                      LV_PART_KNOB); /*Be sure the knob is not displayed*/
+  lv_obj_remove_flag(arc_current_home_power,
+                     LV_OBJ_FLAG_CLICKABLE); /*To not allow adjusting by click*/
+  lv_arc_set_value(arc_current_home_power, 30);
+  lv_obj_set_align(arc_current_home_power, LV_ALIGN_TOP_MID);
+  lv_obj_set_grid_cell(arc_current_home_power, LV_GRID_ALIGN_STRETCH, 0, 1,
+                       LV_GRID_ALIGN_STRETCH, 0, 4);
+  lv_obj_t *label_current_home_power = lv_label_create(arc_current_home_power);
+  lv_obj_add_style(label_current_home_power, &label_font18_style, 0);
+  lv_label_set_text(label_current_home_power, "3455 W");
+  lv_obj_center(label_current_home_power);
+
+  lv_obj_t *label_current_home_power_txt =
+      lv_label_create(arc_current_home_power);
+  lv_label_set_text(label_current_home_power_txt, "Home");
+  lv_obj_align(label_current_home_power_txt, LV_ALIGN_CENTER, 0, 25);
+
+  return home_current_power_obj_t{.arc_obj = arc_current_home_power,
+                                  .label_number_obj = label_current_home_power,
+                                  .max_power = 5000};
+}
+
+static event_single_power_num_t
+create_event_power_item(lv_obj_t *cont, int col, int row, lv_palette_t color,
+                        std::string label_txt, bool is_power_consumption) {
+  lv_obj_t *cont_label = lv_obj_create(cont);
+  lv_obj_set_style_bg_color(cont_label, lv_palette_main(color), 0);
+  lv_obj_set_style_radius(cont_label, 0, 0);
+  lv_obj_set_style_pad_all(cont_label, 0, 0);
+  lv_obj_set_style_pad_right(cont_label, 0, 0);
+  lv_obj_set_style_border_width(cont_label, 0, 0);
+  lv_obj_t *label = lv_label_create(cont_label);
+  lv_label_set_text(label, label_txt.c_str());
+  lv_obj_add_style(label, &label_font18_style, 0);
+  lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+  lv_obj_set_grid_cell(cont_label, LV_GRID_ALIGN_STRETCH, col, 1,
+                       LV_GRID_ALIGN_STRETCH, row, 1);
+  lv_obj_t *cont_number = lv_obj_create(cont);
+  if (is_power_consumption == true) {
+    lv_obj_set_style_bg_color(cont_number, lv_palette_main(color), 0);
+  }
+  lv_obj_set_style_radius(cont_number, 0, 0);
+  lv_obj_set_style_pad_all(cont_number, 0, 0);
+  lv_obj_set_style_pad_right(cont_number, 5, 0);
+  lv_obj_set_style_border_width(cont_number, 0, 0);
+  // *label_num_txt = lv_label_create(cont_number);
+  lv_obj_t *label_num_txt = lv_label_create(cont_number);
+  lv_obj_add_style(label_num_txt, &label_font18_style, 0);
+  lv_label_set_text(label_num_txt, "16.522");
+  lv_obj_align(label_num_txt, LV_ALIGN_RIGHT_MID, 0, 0);
+  lv_obj_set_grid_cell(cont_number, LV_GRID_ALIGN_STRETCH, col + 1, 1,
+                       LV_GRID_ALIGN_STRETCH, row, 1);
+
+  event_single_power_num_t single_power_obj = {
+      .label_number_obj = label_num_txt,
+      .num_type = is_power_consumption
+                      ? single_power_num_type_e::ELECTRICITY_CONSUMPTION
+                      : single_power_num_type_e::POWER,
+      .number = std::nullopt};
+  // initial number should be N/a
+  single_power_obj.set_number("");
+
+  return single_power_obj;
+}
+
+static washer_dryer_obj_t create_single_washer_dryer_panel(
+    int col, int row,
+    std::function<lv_obj_t *(lv_obj_t *)> status_ani_setup_cb) {
+  lv_obj_t *cont = lv_obj_create(t2);
+  lv_obj_set_size(cont, 240, 180);
+  lv_obj_set_style_pad_top(cont, 10, 0);
+  lv_obj_set_style_pad_bottom(cont, 0, 0);
+  lv_obj_t *arc_obj = lv_arc_create(cont);
+  lv_obj_set_size(arc_obj, 120, 120);
+  lv_arc_set_rotation(arc_obj, 270);
+  lv_arc_set_bg_angles(arc_obj, 0, 360);
+  lv_obj_remove_style(arc_obj, NULL,
+                      LV_PART_KNOB); /*Be sure the knob is not displayed*/
+  lv_obj_remove_flag(arc_obj,
+                     LV_OBJ_FLAG_CLICKABLE); /*To not allow adjusting by click*/
+  lv_arc_set_value(arc_obj, 30);
+  lv_obj_set_align(arc_obj, LV_ALIGN_TOP_MID);
+
+  lv_obj_t *label_progress_num = lv_label_create(cont);
+  lv_label_set_text(label_progress_num, "120 min");
+  lv_obj_add_style(label_progress_num, &label_font18_style, 0);
+  lv_obj_align(label_progress_num, LV_ALIGN_TOP_MID, 0, 47);
+
+  lv_obj_t *label_status_txt = lv_label_create(cont);
+  // lv_label_set_text(label_status_txt, "In progress...");
+  lv_label_set_text(label_status_txt, "N/a");
+  lv_obj_add_style(label_status_txt, &label_ms_yahei_style, 0);
+  lv_obj_align(label_status_txt, LV_ALIGN_TOP_MID, 0, 124);
+
+  lv_obj_t *spinner = status_ani_setup_cb(cont);
+
+  // Bell washer
+  lv_obj_t *label_bell = lv_label_create(cont);
+  lv_obj_add_style(label_bell, &label_font32_style, 0);
+  lv_obj_set_style_text_color(label_bell, lv_palette_main(LV_PALETTE_RED), 0);
+  lv_label_set_text(label_bell, LV_SYMBOL_BELL);
+  lv_obj_align(label_bell, LV_ALIGN_LEFT_MID, 0, 0);
+
+  //  lv_obj_add_flag(label_bell_dryer, LV_OBJ_FLAG_HIDDEN);
+  lv_anim_t a_bell;
+  lv_anim_init(&a_bell);
+  lv_anim_set_var(&a_bell, label_bell);
+  lv_anim_set_exec_cb(&a_bell, anim_set_ball_hidden);
+  lv_anim_set_values(&a_bell, 0, 255);
+  lv_anim_set_time(&a_bell, 1000);
+  lv_anim_set_playback_delay(&a_bell, 0);
+  lv_anim_set_playback_time(&a_bell, 1000);
+  lv_anim_set_repeat_count(&a_bell, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_start(&a_bell);
+
+  lv_obj_set_grid_cell(cont, LV_GRID_ALIGN_STRETCH, col, 2,
+                       LV_GRID_ALIGN_STRETCH, row, 2);
+
+  washer_dryer_obj_t to_return = {.arc_obj = arc_obj,
+                                  .label_number_obj = label_progress_num,
+                                  .label_status_txt_obj = label_status_txt,
+                                  .bell_icon_obj = label_bell,
+                                  .animation_icon_obj = spinner,
+                                  .max_minutes = 0,
+                                  .minutes = std::nullopt,
+                                  .alarming = false,
+                                  .status = std::nullopt};
+  to_return.set_alarming(false);
+  to_return.set_animate(false);
+  to_return.set_minutes("");
+  to_return.set_status("");
+
+  return to_return;
+}
+
+static void create_event_tab() {
+  lv_obj_set_style_pad_top(t2, 30, LV_PART_MAIN);
+  lv_obj_clear_flag(t2, LV_OBJ_FLAG_SCROLLABLE);
+
+  static int32_t grid_event_tab_col_dsc[] = {120, 120, 120, 120,
+                                             LV_GRID_TEMPLATE_LAST};
+  static int32_t grid_event_tab_row_dsc[] = {95, 75, LV_GRID_FR(1),
+                                             LV_GRID_TEMPLATE_LAST};
+
+  lv_obj_set_grid_dsc_array(t2, grid_event_tab_col_dsc, grid_event_tab_row_dsc);
+  lv_obj_set_style_pad_column(t2, 0, 0);
+  lv_obj_set_style_pad_row(t2, 0, 0);
+  lv_obj_set_style_pad_top(t2, 0, 0);
+  lv_obj_set_style_pad_bottom(t2, 0, 0);
+  lv_obj_set_style_pad_left(t2, 0, 0);
+
+  event_washer_obj = create_single_washer_dryer_panel(0, 0, [](lv_obj_t *cont) {
+    lv_obj_t *spinner = lv_spinner_create(cont);
+    lv_obj_set_size(spinner, 20, 20);
+    lv_obj_set_style_arc_color(spinner, lv_palette_main(LV_PALETTE_ORANGE),
+                               LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    lv_obj_align(spinner, LV_ALIGN_TOP_MID, 0, 75);
+    lv_spinner_set_anim_params(spinner, 1000, 200);
+    return spinner;
+  });
+  event_dryer_obj = create_single_washer_dryer_panel(2, 0, [](lv_obj_t *cont) {
+    LV_IMAGE_DECLARE(fan);
+    lv_obj_t *fan_img = lv_img_create(cont);
+    lv_img_set_src(fan_img, &fan);
+    // lv_img_set_zoom(fan_img, 36);
+    lv_obj_align(fan_img, LV_ALIGN_TOP_MID, 0, 69);
+
+    // lv_obj_set_style_transform_angle(fan_img, 180, 0);
+    // lv_img_set_angle(fan_img, 180);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, fan_img);
+    lv_anim_set_values(&a, 0, 3600);
+    lv_anim_set_duration(&a, 5000);
+    lv_anim_set_repeat_delay(&a, 0);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_time(&a, 3600);
+    // lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+
+    lv_anim_set_exec_cb(&a, anim_angle_cb);
+    lv_anim_start(&a);
+    return fan_img;
+  });
+
+  for (int i = 0; i < 12; i++) {
+    uint8_t col = i % 4;
+    uint8_t row = i / 4;
+
+    // lv_obj_t *con = lv_obj_create(t2);
+    // lv_obj_set_grid_cell(con, LV_GRID_ALIGN_STRETCH, col, 1,
+    //                      LV_GRID_ALIGN_STRETCH, row, 1);
+    // lv_obj_set_style_bg_color(con, lv_palette_main(LV_PALETTE_RED),
+    //                           LV_PART_MAIN | LV_STATE_DEFAULT);
+  }
+
+  lv_obj_t *cont_power = lv_obj_create(t2);
+  lv_obj_set_grid_cell(cont_power, LV_GRID_ALIGN_STRETCH, 0, 4,
+                       LV_GRID_ALIGN_STRETCH, 2, 1);
+  // lv_obj_set_style_bg_color(cont_power, lv_palette_main(LV_PALETTE_RED),
+  // 0);
+
+  static int32_t grid_power_col_dsc[] = {120,           LV_GRID_FR(1),
+                                         LV_GRID_FR(1), LV_GRID_FR(1),
+                                         LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
+  static int32_t grid_power_row_dsc[] = {LV_GRID_FR(1), LV_GRID_FR(1),
+                                         LV_GRID_FR(1), LV_GRID_FR(1),
+                                         LV_GRID_TEMPLATE_LAST};
+
+  lv_obj_set_grid_dsc_array(cont_power, grid_power_col_dsc, grid_power_row_dsc);
+  lv_obj_set_style_pad_column(cont_power, 0, 0);
+  lv_obj_set_style_pad_row(cont_power, 0, 0);
+  lv_obj_set_style_pad_top(cont_power, 0, 0);
+  lv_obj_set_style_pad_bottom(cont_power, 0, 0);
+  lv_obj_set_style_pad_left(cont_power, 0, 0);
+
+  home_current_power_obj = create_home_current_power_panel(cont_power);
+
+  event_today_power_num_obj = create_event_power_item(
+      cont_power, 1, 0, LV_PALETTE_TEAL, " T Power", true);
+  event_yesterday_power_num_obj = create_event_power_item(
+      cont_power, 1, 1, LV_PALETTE_ORANGE, " Y Power", true);
+  event_fridge_power_num_obj = create_event_power_item(
+      cont_power, 1, 2, LV_PALETTE_LIME, " FG Pw.", false);
+  event_lift_table_power_num_obj = create_event_power_item(
+      cont_power, 1, 3, LV_PALETTE_DEEP_ORANGE, " LT Pw.", false);
+  event_pc_table_power_num_obj = create_event_power_item(
+      cont_power, 3, 0, LV_PALETTE_LIGHT_BLUE, " PT Pw.", false);
+  event_mac_table_power_num_obj = create_event_power_item(
+      cont_power, 3, 1, LV_PALETTE_YELLOW, " MT Pw.", false);
+  event_jigui_power_num_obj = create_event_power_item(
+      cont_power, 3, 2, LV_PALETTE_GREY, " Cab Pw.", false);
+  event_baobao_power_num_obj = create_event_power_item(
+      cont_power, 3, 3, LV_PALETTE_BLUE_GREY, " BT Pw.", false);
+}
+
+static void create_control_tab() {
+  lv_obj_t *btn = lv_button_create(t3);
+  lv_obj_t *label = lv_label_create(btn);
+  lv_label_set_text(label, "Click me!");
+  lv_obj_center(label);
+
+  lv_obj_add_event_cb(btn, event_handler, LV_EVENT_ALL, NULL);
+}
+
+// void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t
+// *px_map) {
+//   /*Copy `px map` to the `area`*/
+//
+//   /*For example ("my_..." functions needs to be implemented by you)
+//   uint32_t w = lv_area_get_width(area);
+//   uint32_t h = lv_area_get_height(area);
+//
+//   my_set_window(area->x1, area->y1, w, h);
+//   my_draw_bitmaps(px_map, w * h);
+//    */
+//
+//   /*Call it to tell LVGL you are ready*/
+//   uint32_t w = lv_area_get_width(area);
+//   uint32_t h = lv_area_get_height(area);
+//
+//   tft.startWrite();
+//   tft.setAddrWindow(area->x1, area->y1, w, h);
+//   tft.pushColors((uint16_t *)&color_p->full, w * h, true);
+//   tft.endWrite();
+//   lv_display_flush_ready(disp);
+// }
+
+typedef struct {
+  TFT_eSPI *tft;
+} lv_tft_espi_t;
+
+// TODO: need to change to pushImageDMA, see
+// https://github.com/Bodmer/TFT_eSPI/blob/5793878d24161c1ed23ccb136f8564f332506d53/Processors/TFT_eSPI_ESP32.c#L651
+// see also:
+// https://github.com/Bodmer/TFT_eSPI/blob/master/examples/DMA%20test/Flash_Jpg_DMA/Flash_Jpg_DMA.ino
+// NOTE: pushImageDMA only support w*h < 65536
+static void flush_cb(lv_display_t *disp, const lv_area_t *area,
+                     uint8_t *px_map) {
+  lv_tft_espi_t *dsc = (lv_tft_espi_t *)lv_display_get_driver_data(disp);
+
+  uint32_t w = lv_area_get_width(area);
+  uint32_t h = lv_area_get_height(area);
+
+  // LV_LOG_USER("x1: %d, y1: %d, w: %d, h: %d", area->x1, area->y1, w, h);
+
+  dsc->tft->startWrite();
+
+#if 1 // USE_DMA
+  dsc->tft->setAddrWindow(area->x1, area->y1, w, h);
+  // dsc->tft->pushColors((uint16_t *)px_map, w * h, true);
+
+  // NOTE: pushImageDMA calls setAddrWindow internally
+  lv_draw_sw_rgb565_swap(px_map, w * h);
+  // dsc->tft->pushImage(area->x1, area->y1, w, h, (uint16_t *)px_map);
+  dsc->tft->pushPixelsDMA((uint16_t *)px_map, w * h);
+#endif
+
+#if 0 // USE_PSRAM
+  dsc->tft->setAddrWindow(area->x1, area->y1, w, h);
+  dsc->tft->pushColors((uint16_t *)px_map, w * h, true);
+#endif
+
+  dsc->tft->endWrite();
+
+  lv_display_flush_ready(disp);
+}
+
+static void resolution_changed_event_cb(lv_event_t *e) {
+  lv_display_t *disp = (lv_display_t *)lv_event_get_target(e);
+  lv_tft_espi_t *dsc = (lv_tft_espi_t *)lv_display_get_driver_data(disp);
+  int32_t hor_res = lv_display_get_horizontal_resolution(disp);
+  int32_t ver_res = lv_display_get_vertical_resolution(disp);
+  lv_display_rotation_t rot = lv_display_get_rotation(disp);
+
+  /* handle rotation */
+  switch (rot) {
+  case LV_DISPLAY_ROTATION_0:
+    dsc->tft->setRotation(0); /* Portrait orientation */
+    break;
+  case LV_DISPLAY_ROTATION_90:
+    dsc->tft->setRotation(1); /* Landscape orientation */
+    break;
+  case LV_DISPLAY_ROTATION_180:
+    dsc->tft->setRotation(2); /* Portrait orientation, flipped */
+    break;
+  case LV_DISPLAY_ROTATION_270:
+    dsc->tft->setRotation(3); /* Landscape orientation, flipped */
+    break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.printf("lv_init()\n");
+  lv_init();
+
+  lv_log_register_print_cb(log_print);
+  // Setup tick hook for lv_tick_task
+  esp_err_t err =
+      esp_register_freertos_tick_hook((esp_freertos_tick_cb_t)lv_tick_task);
+
+  uint32_t f = getCpuFrequencyMhz();
+  Serial.printf("Current CPU Freq: %i\n", f);
+
+  // Enable TFT
+  // tft.begin();
+  // tft.setRotation(1);
+
+  // disp = lv_tft_espi_create(TFT_WIDTH, TFT_HEIGHT, draw_buf,
+  // sizeof(draw_buf));
+  Serial.printf("creating 2 buffer for lvgl drawing...\n");
+  // NOTE: 32 rows, 2 bytes per pixel (16 bit/8=2 bytes)
+  // See: https://forum.lvgl.io/t/dma-framebuffer/13608
+// TODO: can use static buffer
+#if 1 // USE_DMA
+  const uint16_t buf_rows = 48;
+  lv_draw_buf_t *buf_3_1 = (lv_draw_buf_t *)heap_caps_aligned_alloc(
+      64, TFT_WIDTH * buf_rows * 16 / 8, /*MALLOC_CAP_SPIRAM*/
+      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  LV_LOG_USER("buf_3_1=%p", buf_3_1);
+  lv_draw_buf_t *buf_3_2 = (lv_draw_buf_t *)heap_caps_aligned_alloc(
+      64, TFT_WIDTH * buf_rows * 16 / 8, /*MALLOC_CAP_SPIRAM*/
+      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  // static lv_draw_buf_t *buf_3_1 =
+  //     (lv_draw_buf_t *)malloc(TFT_WIDTH * buf_rows * 16 / 8);
+  // static lv_draw_buf_t *buf_3_2 =
+  //     (lv_draw_buf_t *)malloc(TFT_WIDTH * buf_rows * 16 / 8);
+  LV_LOG_USER("buf_3_2=%p", buf_3_2);
+#endif
+
+#if 0 // USE_PSRAM
+  LV_LOG_USER("psram size: %d", esp_get_free_heap_size());
+
+  const uint16_t buf_rows = TFT_HEIGHT;
+  lv_draw_buf_t *buf_3_1 = (lv_draw_buf_t *)heap_caps_malloc(
+      TFT_WIDTH * buf_rows * 16 / 8, MALLOC_CAP_SPIRAM);
+  LV_LOG_USER("buf_3_1=%p", buf_3_1);
+  lv_draw_buf_t *buf_3_2 = (lv_draw_buf_t *)heap_caps_malloc(
+      TFT_WIDTH * buf_rows * 16 / 8, MALLOC_CAP_SPIRAM);
+  LV_LOG_USER("buf_3_2=%p", buf_3_2);
+#endif
+
+  lv_tft_espi_t *dsc = (lv_tft_espi_t *)lv_malloc_zeroed(sizeof(lv_tft_espi_t));
+  LV_ASSERT_MALLOC(dsc);
+  if (dsc == NULL)
+    return;
+
+  Serial.printf("lv_display_create...\n");
+  lv_display_t *disp = lv_display_create(TFT_WIDTH, TFT_HEIGHT);
+  if (disp == NULL) {
+    lv_free(dsc);
+    return;
+  }
+
+  dsc->tft = new TFT_eSPI(TFT_WIDTH, TFT_HEIGHT);
+  dsc->tft->begin();   /* TFT init */
+#if 1                  // USE_DMA
+  dsc->tft->initDMA(); /* init DMA */
+#endif
+  dsc->tft->setRotation(3);
+  lv_display_set_driver_data(disp, (void *)dsc);
+  lv_display_set_flush_cb(disp, flush_cb);
+  lv_display_add_event_cb(disp, resolution_changed_event_cb,
+                          LV_EVENT_RESOLUTION_CHANGED, NULL);
+#if 1 // USE_DMA
+  lv_display_set_buffers(disp, (void *)buf_3_1, (void *)buf_3_2,
+                         TFT_WIDTH * buf_rows * 16 / 8,
+                         LV_DISPLAY_RENDER_MODE_PARTIAL);
+#endif
+
+#if 0 // USE_PSRAM
+  lv_display_set_buffers(disp, (void *)buf_3_1, (void *)buf_3_2,
+                         TFT_WIDTH * buf_rows * 16 / 8,
+                         LV_DISPLAY_RENDER_MODE_FULL);
+#endif
+
+  // Enable Backlight
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, 1);
+
+  // Start TouchScreen
+  touchScreen.begin();
+
+  // NOTE: touch screen setup
+  lv_indev_t *indev = lv_indev_create();
+  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(indev, touchscreen_read);
+
+#if 0
+  // lv_demo_benchmark();
+  lv_demo_widgets();
+#endif
+
+#if 1
+  // NOTE: init style
+  lv_style_init(&arc_style);
+  lv_style_set_arc_width(&arc_style, 16);
+  lv_style_init(&label_font18_style);
+  /* lv_style_set_bg_color(&label_style, lv_palette_main(LV_PALETTE_RED)); */
+  /* lv_style_set_bg_opa(&label_style, LV_OPA_COVER); */
+  lv_style_set_text_font(&label_font18_style, &lv_font_montserrat_18);
+  lv_style_init(&charging_label_style);
+  lv_style_set_text_color(&charging_label_style,
+                          lv_palette_main(LV_PALETTE_ORANGE));
+  lv_style_init(&label_style_nerd_sun);
+  lv_style_set_text_font(&label_style_nerd_sun, &nerd_sun);
+  lv_style_set_text_color(&label_style_nerd_sun,
+                          lv_palette_main(LV_PALETTE_DEEP_ORANGE));
+  lv_style_init(&label_font32_style);
+  lv_style_set_text_font(&label_font32_style, &lv_font_montserrat_32);
+
+  lv_style_init(&label_ms_yahei_style);
+  lv_style_set_text_font(&label_ms_yahei_style, &ms_yahei);
+
+  tv = lv_tabview_create(lv_screen_active());
+  lv_tabview_set_tab_bar_size(tv, 30);
+
+  t1 = lv_tabview_add_tab(tv, LV_SYMBOL_BATTERY_1 " Mobile");
+  t2 = lv_tabview_add_tab(tv, LV_SYMBOL_WARNING " Event");
+  t3 = lv_tabview_add_tab(tv, LV_SYMBOL_LIST " Control");
+
+  create_mobile_tab();
+  create_event_tab();
+  create_control_tab();
+#endif
+}
+
+void loop() {
+  lv_task_handler();
+  delay(1);
+}

@@ -1,0 +1,8 @@
+[project-build-run]
+# macros in the "$(...)" form will be substituted, 
+# shell command, use quotation for filenames containing spaces
+command=pio run
+# working directory
+cwd=<root>
+output=terminal
+pos=toggleterm3
